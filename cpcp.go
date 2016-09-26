@@ -11,27 +11,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-
-	"github.com/jessevdk/go-flags"
 )
 
 func CPCP(args []string) error {
-	cfg, args, err := parseArgs(args)
+	cfg, srcs, dst, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
 	if cfg.verbosity > 1 {
 		fmt.Printf("cfg is %#v\n", cfg)
-		fmt.Printf("args are %#v\n", args)
+		fmt.Printf("srcs are %#v\n", srcs)
+		fmt.Printf("dst is %#v\n", dst)
 	}
-	switch len(args) {
-	case 0:
-		return errors.New("nothing specified to copy")
-	case 1:
-		return fmt.Errorf("missing destination parameter after %q", args[0])
-	}
-	srcs := args[:len(args)-1]
-	dst := args[len(args)-1]
 
 	u := syscall.Umask(0)
 	syscall.Umask(u)
@@ -81,10 +72,10 @@ func CPCP(args []string) error {
 			dst = path.Join(dst, path.Base(src))
 		}
 		var srcfi os.FileInfo
-		if cfg.noDereference {
-			srcfi, err = os.Lstat(src)
-		} else {
+		if cfg.dereference {
 			srcfi, err = os.Stat(src)
+		} else {
+			srcfi, err = os.Lstat(src)
 		}
 		if err != nil {
 			errs <- fmtErr(src, err)
@@ -107,10 +98,10 @@ func CPCP(args []string) error {
 		} else {
 			for _, src := range srcs {
 				var srcfi os.FileInfo
-				if cfg.noDereference {
-					srcfi, err = os.Lstat(src)
-				} else {
+				if cfg.dereference {
 					srcfi, err = os.Stat(src)
+				} else {
+					srcfi, err = os.Lstat(src)
 				}
 				if err != nil {
 					errs <- fmtErr(src, err)
@@ -145,31 +136,32 @@ func CPCP(args []string) error {
 
 type config struct {
 	verbosity     int
-	noDereference bool
+	dereference   bool
 	recursive     bool
+	preserveLinks bool
+	preserveMode  bool
 	messageBuffer int
 	errBuffer     int
 	parallelTasks int
 	readdirBuffer int
 	copyBuffer    int
-	umask         os.FileMode
-	preserveLinks bool
-	preserveMode  bool
+
+	umask os.FileMode
 }
 
-type parseOpts struct {
-	Verbosity     []bool `short:"v" long:"verbose" description:"Outputs details of work done."`
-	Dereference   bool   `short:"L" long:"dereference" description:"Follow links in source and copy what is pointed to."`
-	NoDereference bool   `short:"P" long:"no-dereference" description:"Does not follow links in source and instead makes similar links in destination."`
-	Preserve      string `long:"preserve" description:"Preserve specified attributes. Available: links,all"`
-	Recursive     bool   `short:"r" long:"recursive" description:"Copies directories recursively."`
-	Recursive2    bool   `short:"R" description:"Alias for --recursive"`
-	ShortcutA     bool   `short:"a" long:"archive" description:"Same as -dR --preserve=all"`
-	ShortcutD     bool   `short:"d" description:"Same as --no-dereference --preserve=links"`
-}
-
-func parseArgs(args []string) (*config, []string, error) {
-	cfg := &config{}
+func parseArgs(args []string) (*config, []string, string, error) {
+	cfg := &config{
+		verbosity:     0,
+		dereference:   true,
+		recursive:     false,
+		preserveLinks: false,
+		preserveMode:  false,
+		messageBuffer: 1000,
+		errBuffer:     1000,
+		parallelTasks: 1000,
+		readdirBuffer: 1000,
+		copyBuffer:    65536,
+	}
 	setPreserve := func(arg string) error {
 		preserves := strings.Split(arg, ",")
 		for _, preserve := range preserves {
@@ -188,74 +180,84 @@ func parseArgs(args []string) (*config, []string, error) {
 		}
 		return nil
 	}
-	oargs := args
-L:
-	for {
-		for i, arg := range oargs {
-			if strings.HasPrefix(arg, "--preserve=") {
-				if err := setPreserve(arg[len("--preserve="):]); err != nil {
-					return nil, nil, err
+	var srcs []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "" || args[i][0] != '-' {
+			srcs = append(srcs, args[i])
+			continue
+		}
+		if args[i] == "-" {
+			srcs = append(srcs, args[i+1:]...)
+			continue
+		}
+		var opts []string
+		if args[i][1] == '-' {
+			opt := args[i][2:]
+			if !strings.Contains(opt, "=") {
+				if opt == "preserve" {
+					i++
+					if len(args) <= i {
+						return nil, nil, "", fmt.Errorf("--preserve requires a parameter")
+					}
+					opt += "=" + args[i]
 				}
-				oargs = append(oargs[:i], oargs[i+1:]...)
-				goto L
 			}
-			switch arg {
-			case "-a", "--archive":
-				ooargs := make([]string, len(oargs))
-				copy(ooargs, oargs)
-				// TODO: Should be -dR and not -d -R which are the same thing,
-				// but not parsed the same right now. Going to have to rework
-				// things based on this. Probably will have to drop using
-				// github.com/jessevdk/go-flags and do it ourselves because the
-				// original cp is too complex.
-				oargs = append(oargs[:i], "-d", "-R", "--preserve=all")
-				oargs = append(oargs, ooargs[i+1:]...)
-				goto L
-			case "-d":
-				ooargs := make([]string, len(oargs))
-				copy(ooargs, oargs)
-				oargs = append(oargs[:i], "--no-dereference", "--preserve=links")
-				oargs = append(oargs, ooargs[i+1:]...)
-				goto L
-			case "--preserve":
-				if err := setPreserve(oargs[i+1]); err != nil {
-					return nil, nil, err
+			opts = append(opts, opt)
+		} else {
+			for _, s := range args[i][1:] {
+				switch s {
+				case 'a':
+					opts = append(opts, "archive")
+				case 'd':
+					opts = append(opts, "no-dereference", "preserve=links")
+				case 'L':
+					opts = append(opts, "dereference")
+				case 'P':
+					opts = append(opts, "no-dereference")
+				case 'r', 'R':
+					opts = append(opts, "recursive")
+				case 'v':
+					opts = append(opts, "verbose")
 				}
-				oargs = append(oargs[:i], oargs[i+2:]...)
-				goto L
-			case "-R":
-				oargs[i] = "-r"
 			}
 		}
-		break
-	}
-	opts := &parseOpts{}
-	args, err := flags.ParseArgs(opts, oargs)
-	if err != nil {
-		return nil, nil, err
-	}
-	noderef := false
-	// cp allows you specify these conflicting options and seems to just
-	// use the last one specified.
-	// NOTE: Will need to keep on top of when we add new options that
-	// implicitly set these options as well.
-	for _, arg := range oargs {
-		switch arg {
-		case "-L", "--dereference":
-			noderef = false
-		case "-P", "--no-dereference":
-			noderef = true
+		var nopts []string
+		for _, opt := range opts {
+			if opt == "archive" {
+				nopts = append(nopts, "no-dereference", "recursive", "preserve=all")
+			} else {
+				nopts = append(nopts, opt)
+			}
+		}
+		opts = nopts
+		for _, opt := range opts {
+			var arg string
+			s := strings.SplitN(opt, "=", 2)
+			if len(s) > 1 {
+				opt = s[0]
+				arg = s[1]
+			}
+			switch opt {
+			case "dereference":
+				cfg.dereference = true
+			case "no-dereference":
+				cfg.dereference = false
+			case "preserve":
+				setPreserve(arg)
+			case "recursive":
+				cfg.recursive = true
+			case "verbose":
+				cfg.verbosity++
+			}
 		}
 	}
-	cfg.verbosity = len(opts.Verbosity)
-	cfg.noDereference = noderef
-	cfg.recursive = opts.Recursive
-	cfg.messageBuffer = 1000
-	cfg.errBuffer = 1000
-	cfg.parallelTasks = 1000
-	cfg.readdirBuffer = 1000
-	cfg.copyBuffer = 65536
-	return cfg, args, nil
+	switch len(srcs) {
+	case 0:
+		return nil, nil, "", errors.New("nothing specified to copy")
+	case 1:
+		return nil, nil, "", fmt.Errorf("missing destination parameter after %q", srcs[0])
+	}
+	return cfg, srcs[:len(srcs)-1], srcs[len(srcs)-1], nil
 }
 
 type copyTask struct {
