@@ -436,7 +436,15 @@ func copier(cfg *config, msgs chan string, errs chan string, wg *sync.WaitGroup,
 			if err != nil {
 				errs <- fmtErr(src, err)
 			} else if err = os.Symlink(target, dst); err != nil {
-				errs <- fmtErr(dst, err)
+				if os.IsExist(err) {
+					if err = os.Remove(dst); err != nil {
+						errs <- fmtErr(dst, fmt.Errorf("destination of symlink already exists and cannot be removed: %s", err))
+					} else if err = os.Symlink(target, dst); err != nil {
+						errs <- fmtErr(dst, err)
+					}
+				} else {
+					errs <- fmtErr(dst, err)
+				}
 			}
 		}
 		wg.Done()
