@@ -7,11 +7,34 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 )
+
+var HELP_TEXT = errors.New(strings.TrimSpace(`
+Copies files and directories with parallelism; tries to be GNU cp compatible.
+
+Currently supports the following options:
+
+-a --archive
+-d
+--help
+-L --dereference
+-P --no-dereference
+--preserve=ATTR_LIST
+    Current support in ATTR_LIST for links,mode,all.
+-R -r --recursive
+-v --verbose
+
+Also has the following options:
+
+--x-parallel-tasks=N
+    Attempts will be made to concurrently copy files and directories up the
+    limit of N. Default for N is 100.
+`))
 
 func CPCP(args []string) error {
 	cfg, srcs, dst, err := parseArgs(args)
@@ -158,27 +181,9 @@ func parseArgs(args []string) (*config, []string, string, error) {
 		preserveMode:  false,
 		messageBuffer: 1000,
 		errBuffer:     1000,
-		parallelTasks: 1000,
+		parallelTasks: 100,
 		readdirBuffer: 1000,
 		copyBuffer:    65536,
-	}
-	setPreserve := func(arg string) error {
-		preserves := strings.Split(arg, ",")
-		for _, preserve := range preserves {
-			switch preserve {
-			case "":
-			case "links":
-				cfg.preserveLinks = true
-			case "mode":
-				cfg.preserveMode = true
-			case "all":
-				cfg.preserveLinks = true
-				cfg.preserveMode = true
-			default:
-				return fmt.Errorf("unsupported preserve specification %q\n", preserve)
-			}
-		}
-		return nil
 	}
 	var srcs []string
 	for i := 0; i < len(args); i++ {
@@ -214,7 +219,7 @@ func parseArgs(args []string) (*config, []string, string, error) {
 					opts = append(opts, "dereference")
 				case 'P':
 					opts = append(opts, "no-dereference")
-				case 'r', 'R':
+				case 'R', 'r':
 					opts = append(opts, "recursive")
 				case 'v':
 					opts = append(opts, "verbose")
@@ -240,14 +245,47 @@ func parseArgs(args []string) (*config, []string, string, error) {
 			switch opt {
 			case "dereference":
 				cfg.dereference = true
+			case "help":
+				return nil, nil, "", HELP_TEXT
 			case "no-dereference":
 				cfg.dereference = false
 			case "preserve":
-				setPreserve(arg)
+				if arg == "" {
+					return nil, nil, "", fmt.Errorf("--preserve requires a parameter")
+				}
+				preserves := strings.Split(arg, ",")
+				for _, preserve := range preserves {
+					switch preserve {
+					case "":
+					case "links":
+						cfg.preserveLinks = true
+					case "mode":
+						cfg.preserveMode = true
+					case "all":
+						cfg.preserveLinks = true
+						cfg.preserveMode = true
+					default:
+						return nil, nil, "", fmt.Errorf("unsupported preserve specification %q\n", preserve)
+					}
+				}
 			case "recursive":
 				cfg.recursive = true
 			case "verbose":
 				cfg.verbosity++
+			case "x-parallel-tasks":
+				if arg == "" {
+					return nil, nil, "", fmt.Errorf("--x-parallel-tasks requires a parameter")
+				}
+				n, err := strconv.Atoi(arg)
+				if err != nil {
+					return nil, nil, "", fmt.Errorf("could not parse number %q for --x-parallel-tasks", arg)
+				}
+				if n < 1 {
+					n = 1
+				}
+				cfg.parallelTasks = n
+			default:
+				return nil, nil, "", fmt.Errorf("unknown option %q", opt)
 			}
 		}
 	}
